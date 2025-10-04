@@ -1175,4 +1175,20 @@ async def generator(ctx, width, height):
     await ctx.send("```" + "".join(output_holder) + "```")
 
 
+@bot.command(name='keyparty', help='pings the keyparty roles')
+async def keyparty(ctx):
+    role_ids = [1181822056719978578, 1181822134201356389, 1181822218385244170]
+    mentions = []
+    
+    for role_id in role_ids:
+        role = ctx.guild.get_role(role_id)
+        if role:
+            mentions.append(role.mention)
+    
+    if mentions:
+        await ctx.send(f"https://i.imgur.com/riLASwa.png {' '.join(mentions)}")
+    else:
+        await ctx.send("Could not find any keyparty roles.")
+
+
 bot.run(TOKEN)
