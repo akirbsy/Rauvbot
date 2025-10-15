@@ -8,6 +8,7 @@ import string
 import datetime
 import requests
 import asyncio
+import json
 
 from datetime import datetime, timedelta, timezone
 from discord.ext import tasks, commands
@@ -20,10 +21,104 @@ PASTEBIN = os.getenv('PASTEBIN_URL')
 WORDS = os.getenv('WORDS').split(',')
 last_results = set()  # To store the previous results for comparison
 soundboard_disabled_until = None
+REMINDERS_FILE = 'reminders.json'
 
 intents = discord.Intents.all()
 intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents)
+
+
+def load_reminders():
+    """Load reminders from JSON file"""
+    try:
+        with open(REMINDERS_FILE, 'r') as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+
+
+def save_reminders(reminders):
+    """Save reminders to JSON file"""
+    with open(REMINDERS_FILE, 'w') as f:
+        json.dump(reminders, f, indent=2)
+
+
+def add_reminder(user_id, reminder_text, due_time, is_repeat_task=False, repeat_interval_minutes=None):
+    """Add a new reminder"""
+    reminders = load_reminders()
+    if user_id not in reminders:
+        reminders[user_id] = []
+    
+    reminder_data = {
+        'text': reminder_text,
+        'due_time': due_time.isoformat(),
+        'is_repeat_task': is_repeat_task,
+        'last_sent': None,
+        'escalation_count': 0
+    }
+    
+    if is_repeat_task and repeat_interval_minutes:
+        reminder_data['repeat_interval_minutes'] = repeat_interval_minutes
+    
+    reminders[user_id].append(reminder_data)
+    save_reminders(reminders)
+
+
+def parse_reminder_time(message_content):
+    """Parse time from 'remind me in X hours Y minutes' format"""
+    import re
+    
+    # Remove the "remind me in" prefix and get the rest
+    content = message_content.lower().replace("remind me in", "").strip()
+    
+    # Initialize time variables
+    hours = 0
+    minutes = 0
+    
+    # Pattern to match "X hours" or "X hour"
+    hour_pattern = r'(\d+)\s*hours?'
+    # Pattern to match "Y minutes" or "Y minute"  
+    minute_pattern = r'(\d+)\s*minutes?'
+    
+    # Find hours
+    hour_match = re.search(hour_pattern, content)
+    if hour_match:
+        hours = int(hour_match.group(1))
+    
+    # Find minutes
+    minute_match = re.search(minute_pattern, content)
+    if minute_match:
+        minutes = int(minute_match.group(1))
+    
+    # If no time found, return None
+    if hours == 0 and minutes == 0:
+        return None, None
+    
+    # Calculate total minutes
+    total_minutes = (hours * 60) + minutes
+    
+    # Extract the reminder text (everything after the time)
+    # Remove the time parts from the content to get the reminder text
+    reminder_text = content
+    if hour_match:
+        reminder_text = reminder_text.replace(hour_match.group(0), "").strip()
+    if minute_match:
+        reminder_text = reminder_text.replace(minute_match.group(0), "").strip()
+    
+    # Clean up the reminder text (remove "and", extra spaces, etc.)
+    reminder_text = re.sub(r'\s+and\s+', ' ', reminder_text)
+    reminder_text = re.sub(r'\s+', ' ', reminder_text).strip()
+    
+    # If no reminder text provided, use a default
+    if not reminder_text:
+        if hours > 0 and minutes > 0:
+            reminder_text = f"Reminder after {hours} hour{'s' if hours != 1 else ''} and {minutes} minute{'s' if minutes != 1 else ''}"
+        elif hours > 0:
+            reminder_text = f"Reminder after {hours} hour{'s' if hours != 1 else ''}"
+        else:
+            reminder_text = f"Reminder after {minutes} minute{'s' if minutes != 1 else ''}"
+    
+    return total_minutes, reminder_text
 
 
 @bot.event
@@ -35,6 +130,84 @@ async def on_ready():
     print(WORDS[0])
     print(WORDS[1])
     print(WORDS[2])
+    # Start the reminder checker task
+    check_reminders.start()
+    print("Reminder checker task started.")
+
+@tasks.loop(seconds=15)
+async def check_reminders():
+    """Check for due reminders every 15 seconds"""
+    try:
+        reminders = load_reminders()
+        current_time = datetime.now(timezone.utc)
+        updated = False
+        
+        for user_id, user_reminders in list(reminders.items()):
+            completed_reminders = []
+            
+            for i, reminder in enumerate(user_reminders):
+                due_time = datetime.fromisoformat(reminder['due_time'])
+                last_sent = reminder.get('last_sent')
+                is_repeat_task = reminder.get('is_repeat_task', False)
+                
+                # Check if reminder is due
+                if current_time >= due_time:
+                    # Check if this is an escalation (5 minutes since last sent)
+                    should_send = True
+                    if last_sent:
+                        last_sent_time = datetime.fromisoformat(last_sent)
+                        time_since_last = current_time - last_sent_time
+                        if time_since_last < timedelta(minutes=5):
+                            should_send = False
+                    
+                    if should_send:
+                        # Send the reminder
+                        try:
+                            user = bot.get_user(int(user_id))
+                            if user:
+                                escalation_text = ""
+                                if last_sent and is_repeat_task:
+                                    escalation_count = reminder.get('escalation_count', 0) + 1
+                                    reminder['escalation_count'] = escalation_count
+                                    escalation_text = f" (Reminder #{escalation_count})"
+                                
+                                await user.send(f"⏰ Reminder: {reminder['text']}{escalation_text}")
+                                
+                                # Update last sent time
+                                reminder['last_sent'] = current_time.isoformat()
+                                updated = True
+                                
+                                # For non-repeat tasks, mark for completion
+                                if not is_repeat_task:
+                                    completed_reminders.append(i)
+                                    
+                        except discord.Forbidden:
+                            print(f"Cannot send reminder DM to user {user_id}. DMs might be disabled or bot is blocked.")
+                            if not is_repeat_task:
+                                completed_reminders.append(i)
+                            updated = True
+                        except Exception as e:
+                            print(f"Error sending reminder to user {user_id}: {e}")
+                            if not is_repeat_task:
+                                completed_reminders.append(i)
+                            updated = True
+            
+            # Remove completed reminders (in reverse order to maintain indices)
+            for i in reversed(completed_reminders):
+                user_reminders.pop(i)
+            
+            # Remove user entry if no reminders left
+            if not user_reminders:
+                del reminders[user_id]
+                updated = True
+        
+        # Save updated reminders if any changes were made
+        if updated:
+            save_reminders(reminders)
+            
+    except Exception as e:
+        print(f"Error in check_reminders: {e}")
+
 
 @tasks.loop(minutes=15)
 async def check_bfa_quests():
@@ -183,6 +356,112 @@ async def on_soundboard_play(ctx):
 async def on_message(message):
     global soundboard_disabled_until
     global last_boopsy
+
+    # Check for reminder request in direct messages
+    if isinstance(message.channel, discord.DMChannel) and message.content.lower().startswith("remind me in"):
+        # Parse the time and reminder text
+        total_minutes, reminder_text = parse_reminder_time(message.content)
+        
+        if total_minutes is None:
+            await message.reply("I couldn't understand the time format. Please use 'remind me in X hours Y minutes' (e.g., 'remind me in 2 hours 30 minutes to take a break').")
+            return
+        
+        # Check if this is a repeat task
+        is_repeat_task = reminder_text.lower().endswith("repeat task")
+        if is_repeat_task:
+            # Remove "repeat task" from the reminder text
+            reminder_text = reminder_text[:-11].strip()
+        
+        # Calculate due time
+        due_time = datetime.now(timezone.utc) + timedelta(minutes=total_minutes)
+        
+        # Add reminder to persistent storage
+        add_reminder(str(message.author.id), reminder_text, due_time, is_repeat_task, total_minutes if is_repeat_task else None)
+        
+        # Create confirmation message
+        hours = total_minutes // 60
+        minutes = total_minutes % 60
+        
+        if hours > 0 and minutes > 0:
+            time_str = f"{hours} hour{'s' if hours != 1 else ''} and {minutes} minute{'s' if minutes != 1 else ''}"
+        elif hours > 0:
+            time_str = f"{hours} hour{'s' if hours != 1 else ''}"
+        else:
+            time_str = f"{minutes} minute{'s' if minutes != 1 else ''}"
+        
+        repeat_note = " This is a repeat task - say 'done' when completed to reschedule, or 'stop reminders' to stop all repeat tasks." if is_repeat_task else ""
+        await message.reply(f"Got it! I'll remind you in {time_str} to {reminder_text}.{repeat_note}")
+
+    # Check for "done" message to reschedule repeat tasks
+    if isinstance(message.channel, discord.DMChannel) and message.content.lower().strip() == "done":
+        reminders = load_reminders()
+        user_id = str(message.author.id)
+        
+        if user_id in reminders:
+            # Find the most recent repeat task for this user
+            repeat_task = None
+            repeat_task_index = -1
+            
+            for i, reminder in enumerate(reminders[user_id]):
+                if reminder.get('is_repeat_task', False):
+                    # Get the most recent repeat task (last one in the list)
+                    repeat_task = reminder
+                    repeat_task_index = i
+            
+            if repeat_task:
+                # Calculate new due time based on current time + original interval
+                repeat_interval = repeat_task.get('repeat_interval_minutes', 0)
+                new_due_time = datetime.now(timezone.utc) + timedelta(minutes=repeat_interval)
+                
+                # Update the reminder with new due time and reset escalation
+                reminders[user_id][repeat_task_index]['due_time'] = new_due_time.isoformat()
+                reminders[user_id][repeat_task_index]['last_sent'] = None
+                reminders[user_id][repeat_task_index]['escalation_count'] = 0
+                save_reminders(reminders)
+                
+                # Create confirmation message
+                hours = repeat_interval // 60
+                minutes = repeat_interval % 60
+                
+                if hours > 0 and minutes > 0:
+                    time_str = f"{hours} hour{'s' if hours != 1 else ''} and {minutes} minute{'s' if minutes != 1 else ''}"
+                elif hours > 0:
+                    time_str = f"{hours} hour{'s' if hours != 1 else ''}"
+                else:
+                    time_str = f"{minutes} minute{'s' if minutes != 1 else ''}"
+                
+                await message.reply(f"Task completed! I'll remind you again in {time_str} to {repeat_task['text']}.")
+            else:
+                await message.reply("I don't have any active repeat tasks for you to mark as done.")
+
+    # Check for "stop reminders" command to cancel repeat tasks
+    if isinstance(message.channel, discord.DMChannel) and message.content.lower().strip() == "stop reminders":
+        reminders = load_reminders()
+        user_id = str(message.author.id)
+        
+        if user_id in reminders:
+            # Find and remove all repeat tasks for this user
+            repeat_tasks_removed = 0
+            remaining_reminders = []
+            
+            for reminder in reminders[user_id]:
+                if reminder.get('is_repeat_task', False):
+                    repeat_tasks_removed += 1
+                else:
+                    remaining_reminders.append(reminder)
+            
+            # Update the reminders
+            if repeat_tasks_removed > 0:
+                reminders[user_id] = remaining_reminders
+                if not remaining_reminders:
+                    del reminders[user_id]
+                save_reminders(reminders)
+                
+                await message.reply(f"Stopped {repeat_tasks_removed} repeat task{'s' if repeat_tasks_removed != 1 else ''}. You won't receive any more reminders for these tasks.")
+            else:
+                await message.reply("You don't have any active repeat tasks to stop.")
+        else:
+            await message.reply("You don't have any active reminders to stop.")
 
     if soundboard_disabled_until and datetime.now(timezone.utc) > soundboard_disabled_until:
         try:
